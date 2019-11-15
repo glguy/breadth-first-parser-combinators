@@ -19,8 +19,8 @@ module Parser
    -- * Chars
    runParserC, getChars, getAny,
 
-   -- * Experiments
-   rewrite, inspect,
+   -- * Debugging
+   inspect,
 
   ) where
 
@@ -31,7 +31,6 @@ import           Data.Kind
 import           Data.List.NonEmpty (NonEmpty)
 import qualified Data.List.NonEmpty as NonEmpty
 import           Text.Show.Functions ()
--- import           Text.Show.Pretty
 
 ------------------------------------------------------------------------
 
@@ -50,11 +49,13 @@ import           Text.Show.Functions ()
 newtype Parser f a = P (forall n x. (a -> P n f x) -> P n f x)
 
 instance Functor (Parser f) where
-  fmap = liftM
+  fmap f (P m) = P \k -> m \x -> k (f x)
 
 instance Applicative (Parser f) where
   pure x = P \k -> k x
-  (<*>)  = ap
+  P m <*> P n = P \k -> m \f -> n \x -> k (f x)
+  P m  *> P n = P \k -> m \_ -> n k
+  P m <*  P n = P \k -> m \x -> n \_ -> k x
 
 instance Monad (Parser f) where
   P m >>= f = P \k -> m \a -> case f a of P g -> g k
@@ -68,6 +69,7 @@ instance Functor f => Alternative (Parser f) where
 
 prim :: Functor f => f a -> Parser f a
 prim x = P \k -> Get (k <$> x)
+{-# INLINE prim #-}
 
 -- | Left-biased choice of two parsers. Right parser results only
 -- used if left parser fails to generate any results.
@@ -238,8 +240,7 @@ munch1 p =
 
 ------------------------------------------------------------------------
 
-instance Show1 ((->) a) where
-  liftShowsPrec _ _ _ _ = showString "<function>"
+instance Show1 ((->) a) where liftShowsPrec _ _ = showsPrec
 
 ------------------------------------------------------------------------
 
@@ -251,12 +252,28 @@ one i =
   do x <- get
      guard (i == x)
 
-runParser :: Parser ((->) a) b -> [a] -> [b]
-runParser = runParser' (flip id)
+runParser :: Show b => Parser ((->) a) b -> [a] -> [b]
+runParser p = aux (startParser p)
+  where
+    aux p [] = finishParser p
+    aux p (x:xs) =
+      let p' = stepParserFun x p
+      in p' `seq` aux p' xs
+
+stepParserFun :: i -> P n ((->) i) a -> P n ((->) i) a
+stepParserFun i p =
+  case p of
+    Fail       -> Fail
+    Commit x   -> Commit $! stepParserFun i x
+    Or x y     -> stepParserFun i x ||| stepParserFun i y
+    Biased x y -> biased (stepParserFun i x) (stepParserFun i y)
+
+    Done _     -> Fail
+    Get k      -> k i
 
 ------------------------------------------------------------------------
 
-newtype Delay a = D a
+data Delay a = D a
   deriving (Show, Functor)
 
 instance Show1 Delay where
@@ -295,12 +312,9 @@ data Chars a
 
 instance Show1 Chars where
   liftShowsPrec s _ p (Known x y) =
-    showParen (p >= 11)
-    $ showString "Known " . showsPrec 11 x . showString " "
-                          . s 11 y
-  liftShowsPrec _ _ p (AnyChar f) =
-    showParen (p >= 11)
-    $ showString "AnyChar " . showsPrec 11 f
+    showsBinaryWith showsPrec s "Known" p x y
+  liftShowsPrec _ _ p (AnyChar x) =
+    showsUnaryWith showsPrec "AnyChar" p x
 
 getChars :: String -> Parser Chars ()
 getChars []     = pure ()
@@ -339,6 +353,3 @@ deriving instance Show (SN n)
 
 inspect :: (Show a, Show1 f) => Parser f a -> IO ()
 inspect = putStrLn . show . startParser
-
-rewrite :: (forall m x. P m f x -> P m f x) -> Parser f a -> Parser f a
-rewrite f (P p) = P \k -> f (p k)

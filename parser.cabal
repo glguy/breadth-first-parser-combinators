@@ -33,3 +33,11 @@ test-suite parser-tests
                        tasty-hunit ^>= 0.10.0,
   hs-source-dirs:      test
   default-language:    Haskell2010
+
+test-suite lazy-check
+  type: exitcode-stdio-1.0
+  main-is: Lazy.hs
+  ghc-options: -rtsopts=all -with-rtsopts=-M50M
+  build-depends:       base >=4.12 && <4.14, parser
+  hs-source-dirs:      test
+  default-language:    Haskell2010
