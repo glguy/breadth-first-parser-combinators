@@ -2,6 +2,7 @@ module Main where
 
 import Control.Monad
 import Parser
+import Parser.Function as Parser
 
 n :: Int
 n = 2 ^ (25 :: Int)

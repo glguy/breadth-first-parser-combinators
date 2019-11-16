@@ -1,23 +1,37 @@
-{-# Language KindSignatures, StandaloneDeriving, DeriveTraversable, GADTs,
-             DataKinds, BlockArguments, RankNTypes, EmptyCase #-}
-{-# Options_GHC -Wall -Wno-orphans #-}
-module Parser
-  (Parser(P), (<||),
+{-# Language KindSignatures, StandaloneDeriving, DeriveTraversable, GADTs, LambdaCase,
+             DataKinds, BlockArguments, RankNTypes, EmptyCase, ScopedTypeVariables #-}
+{-# Options_GHC -Wall #-}
+{-|
+Module      : Parser
+Description : Incremental parsers with biased and unbiased choice
+Copyright   : Eric Mertens
+License     : ISC
+Maintainer  : emertens@gmail.com
 
-   -- * Generic combinators
+This module implements an incremental parser combinator library similar
+to ReadP. Unlike ReadP, this implementation does not use backtracking to
+implement biased choice, which means even with biased choice the input
+token stream can be released as early as possible.
+-}
+module Parser
+  (
+   -- * Public interface
+   Parser,
+
+   (<||), (||>), prim,
+
+   -- * Eager parsing
    munch0, munch1,
 
-   -- * Functions
-   runParser, get, one,
+   -- * Parser stepping
+   runParser', Resume,
+   startParser, stepParser, finishParser,
 
-   -- * Known elements
-   runParser1, get1,
+   -- * Primitives
+   P(..), (|||), biased,
 
-   -- * Delays
-   runParserD, getD,
-
-   -- * Chars
-   runParserC, getChars, getAny,
+   -- * Natural numbers
+   Nat(..), S, Z,
 
    -- * Debugging
    inspect,
@@ -25,12 +39,14 @@ module Parser
   ) where
 
 import           Control.Applicative
-import           Control.Monad
 import           Data.Functor.Classes
+import           Data.Foldable (toList)
 import           Data.Kind
 import           Data.List.NonEmpty (NonEmpty)
 import qualified Data.List.NonEmpty as NonEmpty
-import           Text.Show.Functions ()
+
+-- $setup
+-- >>> import Parser.Function
 
 ------------------------------------------------------------------------
 
@@ -44,39 +60,83 @@ import           Text.Show.Functions ()
 -- * @a@ is type of result of successful parse.
 --
 -- Uses continuation passing transformation to support
--- efficient left-nesting '>>=' when constructing parser
--- states.
-newtype Parser f a = P (forall n x. (a -> P n f x) -> P n f x)
+-- efficient left-nesting ('>>=') when constructing parsers.
+newtype Parser f a = P { (>>-) :: forall n x. (a -> P n f x) -> P n f x }
 
+infixl 1 >>-
+
+-- |
+-- >>> runParser (succ <$> get) "A"
+-- "B"
 instance Functor (Parser f) where
-  fmap f (P m) = P \k -> m \x -> k (f x)
+  fmap f m = P \k -> m >>- \x -> k (f x)
 
+-- |
+-- >>> runParser (one 'A' *> one 'B') "AB"
+-- [()]
 instance Applicative (Parser f) where
-  pure x = P \k -> k x
-  P m <*> P n = P \k -> m \f -> n \x -> k (f x)
-  P m  *> P n = P \k -> m \_ -> n k
-  P m <*  P n = P \k -> m \x -> n \_ -> k x
+  pure x  = P \k -> k x
+  m <*> n = P \k -> m >>- \f -> n >>- \x -> k (f x)
+  m  *> n = P \k -> m >>- \_ -> n >>- k
+  m <*  n = P \k -> m >>- \x -> n >>- \_ -> k x
 
+-- |
+-- >>> let p = get >>= one
+-- >>> runParser p "AA"
+-- [()]
+-- >>> runParser p "AB"
+-- []
 instance Monad (Parser f) where
-  P m >>= f = P \k -> m \a -> case f a of P g -> g k
+  m >>= f = P \k -> m >>- \a -> f a >>- k
+  (>>) = (*>)
+
+-- |
+-- >>> let p = do 'A' <- get; pure 'B'
+-- >>> runParser p "A"
+-- "B"
+-- >>> runParser p "X"
+-- ""
+instance MonadFail (Parser f) where
+  fail _ = P \_ -> Fail
 
 -- | 'empty' is a failing parser and '<|>' is the
 -- unbiased combination of two parsers. All results
 -- from the left and right side will be returned.
+--
+-- >>> runParser (many (some get)) "ABC"
+-- [["ABC"],["AB","C"],["A","BC"],["A","B","C"]]
+--
+-- >>> runParser (get <|> 'X' <$ one 'A' <|> 'Y' <$ one 'B') "A"
+-- "AX"
 instance Functor f => Alternative (Parser f) where
-  empty       = P \_ -> Fail
-  P p <|> P q = P \k -> p k ||| q k
+  empty   = P \_ -> Fail
+  p <|> q = P \k -> (p >>- k) ||| (q >>- k)
 
+-- | Lift a primitive operation parameterized by a result type into a
+-- 'Parser' parameterized by a result type.
 prim :: Functor f => f a -> Parser f a
-prim x = P \k -> Get (k <$> x)
+prim x = P \k -> Prim $! k <$> x
 {-# INLINE prim #-}
 
 -- | Left-biased choice of two parsers. Right parser results only
 -- used if left parser fails to generate any results.
+--
+-- >>> runParser ('1' <$ one 'A' <|| '2' <$ get) "A"
+-- "1"
+-- >>> runParser ('1' <$ one 'A' ||> '2' <$ get) "A"
+-- "2"
+-- >>> runParser ('1' <$ one 'A' <|| '2' <$ get) "B"
+-- "2"
+-- >>> runParser ('1' <$ one 'A' ||> '2' <$ get) "B"
+-- "2"
 (<||) :: Functor f => Parser f a -> Parser f a -> Parser f a
-P p <|| P q = P \k -> biased (p (Commit . k)) (q k)
+p <|| q = P \k -> biased (p >>- Commit . k) (q >>- k)
 
-infixl 3 <||
+-- | Flipped ('<||')
+(||>) :: Functor f => Parser f a -> Parser f a -> Parser f a
+(||>) = flip (<||)
+
+infixl 3 <||, ||>
 
 ------------------------------------------------------------------------
 
@@ -84,14 +144,19 @@ infixl 3 <||
 --
 -- * @n@ index determines how many levels of 'Commit' a parser
 --   has before it can be 'Done'
--- * @f@ deter
+-- * @f@ is type of primitive steps
+-- * @a@ is type of result for completed parses
 data P (n :: Nat) f a
-  = Get (f (P n f a))                     -- ^ primitive parser
+  = Prim (f (P n f a))                    -- ^ primitive parser
   | Or (P n f a) (P n f a)                -- ^ unbiased alternatives
   | Biased (P (S n) f a) (P n f a)        -- ^ left-biased alternatives
   | Fail                                  -- ^ failed parse
-  | Z ~ n => Done   a                     -- ^ successful parse
+  | Z ~ n => Done a                       -- ^ successful parse
   | forall m. S m ~ n => Commit (P m f a) -- ^ commit left-biased parser
+
+deriving instance Foldable    f => Foldable    (P n f)
+deriving instance Functor     f => Functor     (P n f)
+deriving instance Traversable f => Traversable (P n f)
 
 -- | Biased combination of parse results.
 --
@@ -103,7 +168,8 @@ biased Fail       q          = q
 biased p          Fail       = dropCommit p
 biased p          q          = Biased p q
 
--- | Unbiased combination of parser results.
+-- | Unbiased combination of parser results. This is an internal
+-- operation; external users will use ('<|>') for unbiased choice.
 --
 -- * 'Fail' constructors are eliminated.
 -- * 'Commit' constructors are propagated up.
@@ -114,35 +180,40 @@ a        ||| Fail     = a
 a        ||| Commit b = Commit $! dropCommit a ||| b
 a        ||| b        = Or a b
 
+infixl 3 |||
+
 -- | Remove the commit corresponding to the current biased
 -- choice.
 dropCommit :: Functor f => P (S n) f a -> P n f a
-dropCommit = go SZ
+dropCommit = go Here
   where
-    go :: Functor f => SN n -> P (S n) f a -> P n f a
-    go i p =
-      case p of
+    go :: Functor f => Where n -> P (S n) f a -> P n f a
+    go i =
+      \case
         Fail       -> Fail
-        Get k      -> Get $! go i <$> k
+        Prim k     -> Prim $! go i <$> k
         Or     x y -> go i x ||| go i y
-        Biased x y -> biased (go (SS i) x) (go i y)
+        Biased x y -> biased (go (There i) x) (go i y)
         Commit x   ->
           case i of
-            SZ    -> x
-            SS i' -> Commit $! go i' x
+            Here    -> x
+            There j -> Commit $! go j x
 
 instance (Show1 f, Show a) => Show (P n f a) where
-  showsPrec i p =
-    case p of
+  showsPrec i =
+    \case
       Fail       -> showString                          "Fail"
       Done x     -> showsUnaryWith  showsPrec           "Done"   i x
       Or x y     -> showsBinaryWith showsPrec showsPrec "Or"     i x y
       Biased x y -> showsBinaryWith showsPrec showsPrec "Biased" i x y
-      Get k      -> showsUnaryWith  showsPrec1          "Get"    i k
+      Prim k     -> showsUnaryWith  showsPrec1          "Prim"   i k
       Commit x   -> showsUnaryWith  showsPrec           "Commit" i x
 
 ------------------------------------------------------------------------
 
+-- | Functions that turn parser primitives returning parsers into parsers.
+-- These functions are used by 'stepParser' to advance a parser state given
+-- the next token to match.
 type Resume f a = forall m. f (P m f a) -> P m f a
 
 -- | Apply the final continuation to a parser constructor to extract
@@ -150,61 +221,47 @@ type Resume f a = forall m. f (P m f a) -> P m f a
 startParser :: Parser f a -> P Z f a
 startParser (P k) = k Done
 
--- | Apply a resuming function to all the outer-most 'Get'
+-- | Apply a resuming function to all the outer-most 'Prim'
 -- primitives in a parser. This will typically be something like
 -- "Apply the next character from the input stream".
-stepParser :: Functor f => Resume f a -> P n f a -> P n f a
-stepParser f p =
-  case p of
-    Fail       -> Fail
-    Commit x   -> Commit $! stepParser f x
-    Or x y     -> stepParser f x ||| stepParser f y
-    Biased x y -> biased (stepParser f x) (stepParser f y)
+stepParser :: forall n f a. Functor f => Resume f a -> P n f a -> P n f a
+stepParser f = aux
+  where
+    aux :: P m f a -> P m f a
+    aux =
+      \case
+        Fail       -> Fail
+        Commit x   -> Commit $! aux x
+        Or x y     -> aux x ||| aux y
+        Biased x y -> biased (aux x) (aux y)
 
-    Done _     -> Fail
-    Get k      -> f k
+        Done _     -> Fail
+        Prim k     -> f k
+{-# INLINE stepParser #-}
 
 -- | Empty type. Used to indicate parsers with no primitive
 -- operations.
-data Void1 :: Type -> Type
-
-instance Functor Void1 where
-  fmap _ v = case v of {}
+data NoPrim :: Type -> Type
+  deriving (Functor, Foldable, Traversable)
 
 -- | Signal end of input to a parser.
 --
--- * 'Get' parsers become failed.
+-- * 'Prim' parsers become failed.
 -- * 'Biased' choices are resolved.
-stopParser :: Functor f => P n f a -> P n Void1 a
-stopParser p =
-  case p of
+stopParser :: Functor f => P n f a -> P n NoPrim a
+stopParser =
+  \case
     Fail       -> Fail
     Commit x   -> Commit $! stopParser x
     Or x y     -> stopParser x ||| stopParser y
     Biased x y -> biased (stopParser x) (stopParser y)
 
     Done x     -> Done x
-    Get _      -> Fail
+    Prim _     -> Fail
 
--- | Signal end of input with 'stopParser' and extract
--- list of results.
+-- | Signal end of input and extract list of results.
 finishParser :: Functor f => P Z f a -> [a]
-finishParser = results . stopParser
-
--- | Extract list of results from a stopped parser.
--- Stopped parsers should never have biased choices
--- as these are resolved by 'stopParser'.
-results :: P Z Void1 a -> [a]
-results p0 = go p0 []
-  where
-    go :: P Z Void1 a -> [a] -> [a]
-    go p =
-      case p of
-        Fail      -> id
-        Done x    -> (x :)
-        Or x y    -> go x . go y
-        Biased {} -> error "results: unexpected Biased"
-        Get    v  -> case v of {}
+finishParser = toList . stopParser
 
 ------------------------------------------------------------------------
 
@@ -213,6 +270,11 @@ runP' _ _   Fail = Fail -- optimization
 runP' f (x:xs) p = runP' f xs (stepParser (f x) p)
 runP' _ []     p = p
 
+-- | Helper for building run functions given a function that can run
+-- the primitive operations of a parser.
+--
+-- Starts a parser, steps with each element of the input list, and extracts
+-- the results.
 runParser' :: Functor f => (i -> Resume f a) -> Parser f a -> [i] -> [a]
 runParser' f p xs = finishParser (runP' f xs (startParser p))
 
@@ -220,7 +282,14 @@ runParser' f p xs = finishParser (runP' f xs (startParser p))
 
 ------------------------------------------------------------------------
 
--- | Eagerly parse as many of the argument parser as possible.
+-- | Eagerly parse as many of the argument parser as possible. This is
+-- in contrast to 'many' which will be happy to parse fewer elements
+-- than possible.
+--
+-- >>> runParser (liftA2 (,) (munch0 get) (munch0 get)) "ABC"
+-- [("ABC","")]
+-- >>> runParser (liftA2 (,) (many get) (many get)) "ABC"
+-- [("ABC",""),("AB","C"),("A","BC"),("","ABC")]
 munch0 :: Functor f => Parser f a -> Parser f [a]
 munch0 = munchAux []
 
@@ -231,7 +300,13 @@ munchAux acc p =
        Just p_ -> munchAux (p_:acc) p
        Nothing -> pure (reverse acc)
 
--- | Eagerly parse as many of the argument parser as possible.
+-- | Eagerly parse as many of the argument parser as possible requiring
+-- at least one element to be parsed.
+--
+-- >>> runParser (many (munch1 get)) "ABC"
+-- [['A' :| "BC"]]
+-- >>> runParser (many (some get)) "ABC"
+-- [["ABC"],["AB","C"],["A","BC"],["A","B","C"]]
 munch1 :: Functor f => Parser f a -> Parser f (NonEmpty a)
 munch1 p =
   do p_ <- p
@@ -240,116 +315,22 @@ munch1 p =
 
 ------------------------------------------------------------------------
 
-instance Show1 ((->) a) where liftShowsPrec _ _ = showsPrec
-
-------------------------------------------------------------------------
-
-get :: Parser ((->) a) a
-get = prim id
-
-one :: Eq a => a -> Parser ((->) a) ()
-one i =
-  do x <- get
-     guard (i == x)
-
-runParser :: Show b => Parser ((->) a) b -> [a] -> [b]
-runParser p = aux (startParser p)
-  where
-    aux p [] = finishParser p
-    aux p (x:xs) =
-      let p' = stepParserFun x p
-      in p' `seq` aux p' xs
-
-stepParserFun :: i -> P n ((->) i) a -> P n ((->) i) a
-stepParserFun i p =
-  case p of
-    Fail       -> Fail
-    Commit x   -> Commit $! stepParserFun i x
-    Or x y     -> stepParserFun i x ||| stepParserFun i y
-    Biased x y -> biased (stepParserFun i x) (stepParserFun i y)
-
-    Done _     -> Fail
-    Get k      -> k i
-
-------------------------------------------------------------------------
-
-data Delay a = D a
-  deriving (Show, Functor)
-
-instance Show1 Delay where
-  liftShowsPrec s _ p (D x) = showsUnaryWith s "D" p x
-
-getD :: Parser Delay ()
-getD = prim (D ())
-
-runParserD :: Parser Delay a -> Int -> [a]
-runParserD p0 n = finishParser (aux n (startParser p0))
-  where
-    aux :: Int -> P n Delay a -> P n Delay a
-    aux i p
-      | i <= 0    = p
-      | otherwise = stepParser (\(D x) -> aux (i-1) x) p
-
-------------------------------------------------------------------------
-
-runParser1 :: Eq i => Parser ((,) i) a -> [i] -> [a]
-runParser1 = runParser' match1
-
-get1 :: i -> Parser ((,) i) i
-get1 i = prim (i, i)
-
-match1 :: Eq a => a -> Resume ((,) a) b
-match1 x (y, p)
-  | x == y    = p
-  | otherwise = Fail
-
-------------------------------------------------------------------------
-
-data Chars a
-  = Known (NonEmpty Char) a
-  | AnyChar (Char -> a)
-  deriving (Functor, Show)
-
-instance Show1 Chars where
-  liftShowsPrec s _ p (Known x y) =
-    showsBinaryWith showsPrec s "Known" p x y
-  liftShowsPrec _ _ p (AnyChar x) =
-    showsUnaryWith showsPrec "AnyChar" p x
-
-getChars :: String -> Parser Chars ()
-getChars []     = pure ()
-getChars (x:xs) = prim (Known (x NonEmpty.:| xs) ())
-
-getAny :: Parser Chars Char
-getAny = prim (AnyChar id)
-
-matchC :: Char -> Resume Chars a
-matchC c (AnyChar f) = f c
-matchC c (Known (x NonEmpty.:| xs) p)
-  | c == x = case xs of
-               []   -> p
-               y:ys -> Get (Known (y NonEmpty.:| ys) p)
-  | otherwise = Fail
-
-runParserC :: Parser Chars a -> String -> [a]
-runParserC = runParser' matchC
-
-------------------------------------------------------------------------
-
 -- | Type-level natural numbers
-data {-kind-} Nat = Z | S Nat
+data {-kind-} Nat = Z' | S' Nat
 
-type Z = 'Z
-type S = 'S
+type Z = ' Z'
+type S = ' S'
 
--- | Singleton value representation of type-level natural numbers
-data SN :: Nat -> Type where
-  SZ :: SN n
-  SS :: SN n -> SN (S n)
+-- | Singleton value representation of depth of 'Commit' constructors
+-- to remove from a 'P' value.
+data Where :: Nat -> Type where
+  Here  :: Where n
+  There :: Where n -> Where (S n)
 
-deriving instance Show (SN n)
+deriving instance Show (Where n)
 
 ------------------------------------------------------------------------
 
+-- | Debugging functionality for looking at the shape of a parser state.
 inspect :: (Show a, Show1 f) => Parser f a -> IO ()
 inspect = putStrLn . show . startParser
