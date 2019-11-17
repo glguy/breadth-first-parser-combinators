@@ -1,4 +1,13 @@
-{-# Options_GHC -Wall -Wno-orphans #-}
+{-# Options_GHC -Wno-orphans #-}
+{-|
+Module      : Parser.Function
+Description : Parsers that use functions on tokens to construct parsers.
+Copyright   : Eric Mertens
+License     : ISC
+Maintainer  : emertens@gmail.com
+
+This module provides the most commonly used parser combinator structure.
+-}
 module Parser.Function
   (
   -- * Run parser
@@ -13,6 +22,7 @@ import Data.Functor.Classes
 import Text.Show.Functions ()
 
 import Parser
+import Parser.State
 
 -- $setup
 -- >>> import Control.Applicative

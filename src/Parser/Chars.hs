@@ -19,6 +19,7 @@ import qualified Data.List.NonEmpty as NonEmpty
 import           Text.Show.Functions ()
 
 import           Parser
+import           Parser.State
 
 data Chars a
   = Known (NonEmpty Char) a
